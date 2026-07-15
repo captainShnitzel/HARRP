@@ -1,10 +1,12 @@
-//Teensy 4.1 main movement computation 1.21
+//Teensy 4.1 main movement computation - emergency e5 recreated
+// Q3 = old MX ID5 moved to shoulder roll, Q5 = goBILDA PWM servo on pin 36
 #include <Arduino.h>
 #include <math.h>
 #include <Dynamixel2Arduino.h>
+#include <Servo.h>
 
 // ============================================================
-// ROBOT KINEMATICS CONTROLLER:
+// ROBOT KINEMATICS CONTROLLER
 //
 // Input UART line format from robot communication module:
 //   0000 Xx Xy Xz Yx Yy Yz Zx Zy Zz   robot stationary reference IMU
@@ -58,9 +60,9 @@ static constexpr bool DRIVE_MOTORS = true;
 
 static constexpr uint8_t DXL_ID_Q1 = 1;
 static constexpr uint8_t DXL_ID_Q2 = 2;
-static constexpr uint8_t DXL_ID_Q3 = 3;
+static constexpr uint8_t DXL_ID_Q3 = 5;  // emergency: old Q5 MX motor physically moved to Q3
 static constexpr uint8_t DXL_ID_Q4 = 4;
-static constexpr uint8_t DXL_ID_Q5 = 5;
+// Q5 is now a PWM servo, not a Dynamixel in this emergency configuration.
 static constexpr uint8_t DXL_ID_Q6 = 6;
 static constexpr uint8_t DXL_ID_Q7 = 7;
 
@@ -78,6 +80,46 @@ static constexpr MotorMap MAP_Q7 = {-1.0f, 4.0f};
 static constexpr float PI_F = 3.14159265358979323846f;
 static constexpr float DEG2RAD = PI_F / 180.0f;
 static constexpr float RAD2DEG = 180.0f / PI_F;
+
+
+// =========================
+// Q5 emergency goBILDA servo config
+// =========================
+
+Servo q5Servo;
+
+static constexpr uint8_t Q5_SERVO_PIN = 36;
+
+// goBILDA 300-degree servo nominal PWM range.
+static constexpr int Q5_SERVO_MIN_US    = 500;
+static constexpr int Q5_SERVO_CENTER_US = 1500;
+static constexpr int Q5_SERVO_MAX_US    = 2500;
+
+// Conservative mechanical range for emergency robot tests.
+static constexpr int Q5_SERVO_SAFE_MIN_US = 1200;
+static constexpr int Q5_SERVO_SAFE_MAX_US = 1800;
+
+// Physical servo direction correction. Flip to +1.0f if needed.
+static constexpr float Q5_SERVO_DIR = -1.0f;
+
+// goBILDA: 300 degrees over 2000 us.
+static constexpr float Q5_SERVO_US_PER_DEG = 2000.0f / 300.0f;
+
+// Non-blocking command update rate.
+static constexpr uint32_t Q5_SERVO_UPDATE_PERIOD_MS = 20;
+
+// Higher = faster. 1.0 = no additional servo-side smoothing.
+static constexpr float Q5_SERVO_ALPHA = 0.75f;
+
+static int q5ServoTargetUs = Q5_SERVO_CENTER_US;
+static int q5ServoCurrentUs = Q5_SERVO_CENTER_US;
+static uint32_t lastQ5ServoUpdateMs = 0;
+static bool q5ServoInitialized = false;
+
+static void initQ5Servo();
+static int q5DeltaRadToPulseUs(float q5DeltaRad);
+static void setQ5ServoTargetFromDelta(float q5DeltaRad);
+static void updateQ5Servo();
 
 // Relative movement safety limits from startup pose.
 // Q1: no full rotation. Kept conservative for first test.
@@ -386,12 +428,11 @@ static Mat3 worldFrameToStartupRobotRef(const Mat3& R_world) {
 
 static const MotorMap& mapForId(uint8_t id) {
   if (id == DXL_ID_Q1) return MAP_Q1;
-if (id == DXL_ID_Q2) return MAP_Q2;
-if (id == DXL_ID_Q3) return MAP_Q3;
-if (id == DXL_ID_Q4) return MAP_Q4;
-if (id == DXL_ID_Q5) return MAP_Q5;
-if (id == DXL_ID_Q6) return MAP_Q6;
-return MAP_Q7;
+  if (id == DXL_ID_Q2) return MAP_Q2;
+  if (id == DXL_ID_Q3) return MAP_Q3;
+  if (id == DXL_ID_Q4) return MAP_Q4;
+  if (id == DXL_ID_Q6) return MAP_Q6;
+  return MAP_Q7;
 }
 
 static float deltaLimitDeg(uint8_t id, float deg) {
@@ -399,19 +440,25 @@ static float deltaLimitDeg(uint8_t id, float deg) {
   if (id == DXL_ID_Q2) return clampf(deg, Q2_DELTA_MIN_DEG, Q2_DELTA_MAX_DEG);
   if (id == DXL_ID_Q3) return clampf(deg, Q3_DELTA_MIN_DEG, Q3_DELTA_MAX_DEG);
   if (id == DXL_ID_Q4) return clampf(deg, Q4_DELTA_MIN_DEG, Q4_DELTA_MAX_DEG);
-  if (id == DXL_ID_Q5) return clampf(deg, Q5_DELTA_MIN_DEG, Q5_DELTA_MAX_DEG);
   if (id == DXL_ID_Q6) return clampf(deg, Q6_DELTA_MIN_DEG, Q6_DELTA_MAX_DEG);
   return clampf(deg, Q7_DELTA_MIN_DEG, Q7_DELTA_MAX_DEG);
 }
 
 static void setMotorTargetFromDelta(uint8_t id, float qDeltaRad) {
-  
   if (!DRIVE_MOTORS) return;
+
   float qDeltaDeg = deltaLimitDeg(id, qDeltaRad * RAD2DEG);
   MotorMap mp = mapForId(id);
   float targetRawDeg = motorStartRawDeg[id] + mp.sign * mp.gear * qDeltaDeg;
-  if (id == DXL_ID_Q1 || id == DXL_ID_Q2 || id == DXL_ID_Q3) {
-  dxl2.setGoalPosition(id, targetRawDeg, UNIT_DEGREE);
+
+  // Emergency configuration:
+  // Q1/Q2 are XH motors on Protocol 2.0.
+  // Q3 is old ID5 MX motor, therefore Protocol 1.0.
+  if (id == DXL_ID_Q1 || id == DXL_ID_Q2) {
+    dxl2.setGoalPosition(id, targetRawDeg, UNIT_DEGREE);
+  } else {
+    dxl1.setGoalPosition(id, targetRawDeg, UNIT_DEGREE);
+  }
 } else {
   dxl1.setGoalPosition(id, targetRawDeg, UNIT_DEGREE);
 }
@@ -554,7 +601,7 @@ static bool initMotor(uint8_t id) {
   bool ok = true;
   Dynamixel2Arduino* bus = nullptr;
 
-  if (id == DXL_ID_Q1 || id == DXL_ID_Q2 || id == DXL_ID_Q3) {
+  if (id == DXL_ID_Q1 || id == DXL_ID_Q2) {
     dxl2.setPortProtocolVersion(2.0f);
     bus = &dxl2;
   } else {
@@ -594,15 +641,14 @@ static bool initXHMotors() {
   bool ok = true;
   ok &= initMotor(DXL_ID_Q1);
   ok &= initMotor(DXL_ID_Q2);
-  ok &= initMotor(DXL_ID_Q3);
   return ok;
 }
 
 static bool initMXMotors() {
   dxl1.setPortProtocolVersion(1.0f);
   bool ok = true;
+  ok &= initMotor(DXL_ID_Q3);  // emergency Q3 = old ID5 MX motor
   ok &= initMotor(DXL_ID_Q4);
-  ok &= initMotor(DXL_ID_Q5);
   ok &= initMotor(DXL_ID_Q6);
   ok &= initMotor(DXL_ID_Q7);
   return ok;
@@ -808,6 +854,51 @@ static void slewElbowCommandTowardTarget() {
   qElbowCmd.q5 = stepToward(qElbowCmd.q5, qElbowTarget.q5, MAX_STEP_Q5_DEG * DEG2RAD);
 }
 
+
+static void initQ5Servo() {
+  q5Servo.attach(Q5_SERVO_PIN, Q5_SERVO_MIN_US, Q5_SERVO_MAX_US);
+
+  q5ServoTargetUs = Q5_SERVO_CENTER_US;
+  q5ServoCurrentUs = Q5_SERVO_CENTER_US;
+
+  q5Servo.writeMicroseconds(Q5_SERVO_CENTER_US);
+
+  lastQ5ServoUpdateMs = millis();
+  q5ServoInitialized = true;
+}
+
+static int q5DeltaRadToPulseUs(float q5DeltaRad) {
+  float q5Deg = q5DeltaRad * RAD2DEG;
+
+  int pulseUs = (int)(Q5_SERVO_CENTER_US +
+                      Q5_SERVO_DIR * q5Deg * Q5_SERVO_US_PER_DEG);
+
+  return constrain(pulseUs, Q5_SERVO_SAFE_MIN_US, Q5_SERVO_SAFE_MAX_US);
+}
+
+static void setQ5ServoTargetFromDelta(float q5DeltaRad) {
+  q5ServoTargetUs = q5DeltaRadToPulseUs(q5DeltaRad);
+}
+
+static void updateQ5Servo() {
+  if (!q5ServoInitialized) return;
+
+  uint32_t now = millis();
+  if (now - lastQ5ServoUpdateMs < Q5_SERVO_UPDATE_PERIOD_MS) return;
+  lastQ5ServoUpdateMs = now;
+
+  q5ServoCurrentUs =
+    (int)(q5ServoCurrentUs +
+          Q5_SERVO_ALPHA * (q5ServoTargetUs - q5ServoCurrentUs));
+
+  q5ServoCurrentUs = constrain(q5ServoCurrentUs,
+                               Q5_SERVO_SAFE_MIN_US,
+                               Q5_SERVO_SAFE_MAX_US);
+
+  q5Servo.writeMicroseconds(q5ServoCurrentUs);
+}
+
+
 static void sendShoulderTargets() {
   setMotorTargetFromDelta(DXL_ID_Q1, qCmd.q1);
   setMotorTargetFromDelta(DXL_ID_Q2, qCmd.q2);
@@ -816,7 +907,10 @@ static void sendShoulderTargets() {
 
 static void sendElbowTargets() {
   setMotorTargetFromDelta(DXL_ID_Q4, qElbowCmd.q4);
-  setMotorTargetFromDelta(DXL_ID_Q5, qElbowCmd.q5);
+
+  // Q5 is now the goBILDA PWM servo.
+  // This only updates the target; actual servo output is handled by updateQ5Servo().
+  setQ5ServoTargetFromDelta(qElbowCmd.q5);
 }
 
 static void sendWristTargets() {
@@ -957,11 +1051,13 @@ void setup() {
   dxl1.begin(DXL_BAUD);
   dxl1.setPortProtocolVersion(1.0f);
 
+  initQ5Servo();
+
   delay(1000);
   DEBUG_SERIAL.println("\n=== CONTROLLER START ===");
   DEBUG_SERIAL.println("Waiting for 0000, 1111, 2222, 3333 packets.");
-  DEBUG_SERIAL.println("Dynamixel IDs 1-7 are controlled.");
-  DEBUG_SERIAL.println("REF UART baud = 921600.");
+  DEBUG_SERIAL.println("Emergency config: Q1/Q2 XH, Q3=old ID5 MX, Q4 MX, Q5 PWM servo, Q6/Q7 MX.");
+  DEBUG_SERIAL.println("REF UART baud = 2000000.");
   DEBUG_SERIAL.println(USER_SWAP_YZ_CORRECTION ? "User IMU correction: X=X, Y=Z, Z=-Y" : "User IMU correction: OFF");
   DEBUG_SERIAL.println("Shoulder model: R_delta = Rz(q1) * Ry(q2) * Rx(q3)  [q1=ID1/+Z, q2=ID2/local +Y]");
 
@@ -975,6 +1071,8 @@ if (!motorInitOk) {
 }
 
 void loop() {
+  updateQ5Servo();
+
   requestAndReadEspBatch();
 
   uint32_t now = millis();
