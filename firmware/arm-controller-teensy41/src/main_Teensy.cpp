@@ -1,10 +1,10 @@
-//Teensy 4.1 main movoment computaion 1.21
+//Teensy 4.1 main movement computation 1.21
 #include <Arduino.h>
 #include <math.h>
 #include <Dynamixel2Arduino.h>
 
 // ============================================================
-// ROBOT KINEMATICS CONTROLLER
+// ROBOT KINEMATICS CONTROLLER:
 //
 // Input UART line format from robot communication module:
 //   0000 Xx Xy Xz Yx Yy Yz Zx Zy Zz   robot stationary reference IMU
