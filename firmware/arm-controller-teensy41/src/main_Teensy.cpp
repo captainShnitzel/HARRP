@@ -1,4 +1,4 @@
-//Teensy 4.1 main movement computation 1.21
+//Teensy 4.1 main movement computation -RTOS- 2.01
 #include <Arduino.h>
 #include <math.h>
 #include <Dynamixel2Arduino.h>
