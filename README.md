@@ -33,6 +33,36 @@ docs/
 references/                          External source index; papers are not committed
 tools/                               Future test, calibration and support scripts
 ```
+## Arduino Nano ESP32 Development Workflow
+
+The Arduino Nano ESP32 firmware may be edited using VS Code with the
+PlatformIO extension.
+
+However, PlatformIO must not be used to upload firmware to the Arduino
+Nano ESP32 boards used in HARRP.
+
+### Required workflow
+
+- Source-code editing: VS Code / PlatformIO
+- Compilation: Arduino IDE
+- Firmware upload: Arduino IDE
+- Selected board: Arduino Nano ESP32
+
+### Prohibited operations
+
+Do not use:
+
+- The PlatformIO Upload button
+- `pio run --target upload`
+- `pio run -t upload`
+- A generic ESP32-S3 board configuration for uploading
+
+Uploading from PlatformIO has previously left the HARRP Nano ESP32 boards
+unable to start or enumerate normally, requiring restoration of the Arduino
+bootloader.
+
+All firmware releases must therefore be compiled and uploaded through the
+validated Arduino IDE configuration.
 
 ## Versioning policy
 

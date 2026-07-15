@@ -1,0 +1,99 @@
+ESP32-S3 HAND CONTROLLER PINOUT
+===============================
+
+UART
+----
+RX / TX  -> Main robot communication UART
+
+
+MUX
+---
+GPIO20 -> MUX SIG (analog output)
+
+GPIO21 -> MUX S0
+GPIO47 -> MUX S1
+GPIO48 -> MUX S2
+GPIO45 -> MUX S3
+
+
+ENCODERS
+--------
+GPIO35 -> Encoder 1 A
+GPIO36 -> Encoder 1 B
+
+GPIO37 -> Encoder 2 A
+
+GPIO38 -> Encoder 3 A
+
+GPIO39 -> Encoder 4 A
+
+GPIO40 -> Encoder 5 A
+
+GPIO41 -> Encoder 6 A
+
+
+POWER
+-----
+ESP32 3.3V #1 -> Encoder power rail
+
+ESP32 3.3V #2 -> MUX + homing switch power rail
+
+Common GND -> All encoder grounds, MUX ground,
+               switch grounds, motor driver grounds
+
+
+MOTOR DRIVER BUS (18 LINES)
+---------------------------
+Repeated 3 times:
+
+PWMA
+AIN2
+AIN1
+BIN1
+BIN2
+PWMB
+
+
+DRIVER 1
+--------
+1 -> D1_PWMA
+2 -> D1_AIN2
+3 -> D1_AIN1
+4 -> D1_BIN1
+5 -> D1_BIN2
+6 -> D1_PWMB
+
+
+DRIVER 2
+--------
+7  -> D2_PWMA
+8  -> D2_AIN2
+9  -> D2_AIN1
+10 -> D2_BIN1
+11 -> D2_BIN2
+12 -> D2_PWMB
+
+
+DRIVER 3
+--------
+13 -> D3_PWMA
+14 -> D3_AIN2
+15 -> D3_AIN1
+16 -> D3_BIN1
+17 -> D3_BIN2
+18 -> D3_PWMB
+
+
+HOMING SWITCHES
+---------------
+3.3V -> switch -> MUX input
+MUX input -> pulldown resistor -> GND
+
+
+NOTES
+-----
+- MUX powered from 3.3V
+- Encoders powered from 3.3V
+- ESP32 GPIO/ADC pins are NOT 5V tolerant
+- Worm gear motors use single encoder line
+- Encoder 1 uses full quadrature
