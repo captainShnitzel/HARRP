@@ -1,0 +1,13 @@
+## Commercial Viability Summary
+
+HARRP is not intended as a consumer robotic product, but as a modular laboratory R&D platform for developing and testing robotic systems. Its main commercial value is the integration of available technologies into one complete package: a humanoid robotic arm, anthropomorphic hand, wearable sensing, embedded control, communication infrastructure, monitoring, calibration, and future research software support.
+
+The current prototype has a counted hardware cost of approximately **₪22,761**, based on the available invoices and quotations, excluding PETG and several missing secondary components. With PETG, missing electronics, additional motor drivers, power supply, mounts, wiring, and spare parts, the practical prototype hardware cost is estimated at approximately **₪25,000–₪30,000**.
+
+A direct market comparison is difficult because HARRP combines features that are usually sold separately: robotic arms, robotic hands, wearable teleoperation systems, sensing hardware, control software, and research integration tools. Therefore, its commercial value should be compared to the cost of assembling an equivalent research setup from separate commercial systems and custom integration work.
+
+A commercial version of the current HARRP V1 platform could plausibly be positioned around **₪150,000 per unit**, depending on manufacturing volume, assembly quality, documentation, support level, and software maturity. This price point would remain relatively low for a laboratory-oriented robotic research platform.
+
+Future capabilities such as **AI-assisted control, NVIDIA edge-computing integration, EEG/EMG interface support, ROS/NVIDIA tool support, experiment management, data logging, monitoring, and safety supervision** would require the project to enter a dedicated next phase of development. This phase is estimated to require approximately **two additional years of development**. A future AI/EEG/EMG-ready version of the platform would likely fall in the range of **₪250,000–₪350,000 per unit**, depending on production volume, software maturity, and support level.
+
+In this future form, HARRP would be positioned not only as a robotic device, but as a complete robotic product-development environment for laboratories working in teleoperation, assistive robotics, haptics, human-machine interfaces, and AI-assisted robotic control. Its value would come from reducing the time, cost, and integration burden required for researchers to begin work with a complete human-centered robotic platform.

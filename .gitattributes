@@ -1,0 +1,32 @@
+* text=auto eol=lf
+
+# Keep embedded source files readable across Windows and Linux
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.ino text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+
+# Recommended Git LFS patterns for future large CAD and media files.
+# Run `git lfs install` before uncommenting or adding equivalent track rules.
+# *.step filter=lfs diff=lfs merge=lfs -text
+# *.stp  filter=lfs diff=lfs merge=lfs -text
+# *.stl  filter=lfs diff=lfs merge=lfs -text
+# *.3mf  filter=lfs diff=lfs merge=lfs -text
+# *.sldprt filter=lfs diff=lfs merge=lfs -text
+# *.sldasm filter=lfs diff=lfs merge=lfs -text
+# *.mp4 filter=lfs diff=lfs merge=lfs -text
+# *.mov filter=lfs diff=lfs merge=lfs -text
