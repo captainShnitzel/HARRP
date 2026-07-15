@@ -1,4 +1,4 @@
-//v1.0 2024-06-05
+//v1.0 
 #include <Arduino.h>
 #include <SPI.h>
 #include "BNO08x_MultiSPI.h"
