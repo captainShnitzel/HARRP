@@ -1,3 +1,4 @@
+//v1.0.0 2024-06-05
 #include <Arduino.h>
 #include <SPI.h>
 #include "BNO08x_MultiSPI.h"
@@ -25,10 +26,161 @@ WiFiUDP udp;
 bool imu_ok = false;
 bool wifi_ok = false;
 
+// ============================================================
+// Dual 7-segment debug display
+// 2x SN74LS47N, static BCD/raw-glyph drive
+// Board connector:
+//   A0 A1 A2 A3 = right / ones digit BCD A B C D
+//   A4 A5 A6 A7 = left  / tens digit BCD A B C D
+// ============================================================
+
+static constexpr uint8_t DISP_ONES_A = A0;
+static constexpr uint8_t DISP_ONES_B = A1;
+static constexpr uint8_t DISP_ONES_C = A2;
+static constexpr uint8_t DISP_ONES_D = A3;
+
+static constexpr uint8_t DISP_TENS_A = A4;
+static constexpr uint8_t DISP_TENS_B = A5;
+static constexpr uint8_t DISP_TENS_C = A6;
+static constexpr uint8_t DISP_TENS_D = A7;
+
+static constexpr uint8_t DISP_ONES_PINS[4] = {
+  DISP_ONES_A,
+  DISP_ONES_B,
+  DISP_ONES_C,
+  DISP_ONES_D
+};
+
+static constexpr uint8_t DISP_TENS_PINS[4] = {
+  DISP_TENS_A,
+  DISP_TENS_B,
+  DISP_TENS_C,
+  DISP_TENS_D
+};
+
+enum DebugGlyph : uint8_t {
+  GLYPH_0     = 0,
+  GLYPH_1     = 1,
+  GLYPH_2     = 2,
+  GLYPH_3     = 3,
+  GLYPH_4     = 4,
+  GLYPH_5     = 5,
+  GLYPH_6     = 6,
+  GLYPH_7     = 7,
+  GLYPH_8     = 8,
+  GLYPH_9     = 9,
+  GLYPH_10    = 10,
+  GLYPH_11    = 11,
+  GLYPH_12    = 12,
+  GLYPH_13    = 13,
+  GLYPH_14    = 14,
+  GLYPH_BLANK = 15
+};
+
+enum DebugCode : uint8_t {
+  DBG_BOOT            = 0,  // 00 general boot
+  DBG_WAIT_USER       = 1,  // 01 waiting for user side
+  DBG_USER_CONNECTED  = 2,  // 02 user packets detected
+  DBG_WAIT_TEENSY     = 3,  // 03 waiting for Teensy ready
+  DBG_TEENSY_READY    = 4,  // 04 Teensy ready
+  DBG_ROBOT_IMU_OK    = 5,  // 05 robot IMU OK
+  DBG_ALL_IMUS_ACTIVE = 6,  // 06 all user IMUs fresh
+  DBG_TELEOP_ACTIVE   = 7,  // 07 active
+  DBG_PAUSED          = 8,  // 08 paused / disabled
+  DBG_STANDBY         = 9   // 09 standby
+};
+
+enum DebugFault : uint8_t {
+  FAULT_GENERAL        = 0,  // E0
+  FAULT_COMM           = 1,  // E1
+  FAULT_IMU            = 2,  // E2
+  FAULT_TEENSY         = 3,  // E3
+  FAULT_DYNAMIXEL      = 4,  // E4
+  FAULT_HAND           = 5,  // E5
+  FAULT_HAND_CAL       = 6,  // E6
+  FAULT_SAFETY_LOCKOUT = 7,  // E7
+  FAULT_POWER_HW       = 8,  // E8
+  FAULT_FATAL          = 9   // E9
+};
+
+static constexpr DebugGlyph FAULT_PREFIX = GLYPH_13;
+
+static DebugGlyph requestedLeftGlyph  = GLYPH_BLANK;
+static DebugGlyph requestedRightGlyph = GLYPH_BLANK;
+
+static DebugGlyph currentLeftGlyph  = GLYPH_BLANK;
+static DebugGlyph currentRightGlyph = GLYPH_BLANK;
+
+static bool debugDisplayForceRefresh = true;
+
+void writeRawGlyph(const uint8_t pins[4], DebugGlyph glyph) {
+  uint8_t value = ((uint8_t)glyph) & 0x0F;
+
+  digitalWrite(pins[0], (value & 0x01) ? HIGH : LOW);  // BCD A
+  digitalWrite(pins[1], (value & 0x02) ? HIGH : LOW);  // BCD B
+  digitalWrite(pins[2], (value & 0x04) ? HIGH : LOW);  // BCD C
+  digitalWrite(pins[3], (value & 0x08) ? HIGH : LOW);  // BCD D
+}
+
+void initDebugDisplay() {
+  for (int i = 0; i < 4; i++) {
+    pinMode(DISP_ONES_PINS[i], OUTPUT);
+    pinMode(DISP_TENS_PINS[i], OUTPUT);
+
+    digitalWrite(DISP_ONES_PINS[i], LOW);
+    digitalWrite(DISP_TENS_PINS[i], LOW);
+  }
+
+  requestedLeftGlyph  = GLYPH_0;
+  requestedRightGlyph = GLYPH_0;
+
+  currentLeftGlyph  = GLYPH_BLANK;
+  currentRightGlyph = GLYPH_BLANK;
+
+  debugDisplayForceRefresh = true;
+}
+
+void requestDebugGlyphs(DebugGlyph left, DebugGlyph right) {
+  requestedLeftGlyph = left;
+  requestedRightGlyph = right;
+}
+
+void requestDebugCode(DebugCode code) {
+  uint8_t value = (uint8_t)code;
+
+  requestDebugGlyphs(
+    (DebugGlyph)(value / 10),
+    (DebugGlyph)(value % 10)
+  );
+}
+
+void requestDebugFault(DebugFault fault) {
+  requestDebugGlyphs(
+    FAULT_PREFIX,
+    (DebugGlyph)((uint8_t)fault % 10)
+  );
+}
+
+void updateDebugDisplay() {
+  if (!debugDisplayForceRefresh &&
+      requestedLeftGlyph == currentLeftGlyph &&
+      requestedRightGlyph == currentRightGlyph) {
+    return;
+  }
+
+  debugDisplayForceRefresh = false;
+
+  currentLeftGlyph = requestedLeftGlyph;
+  currentRightGlyph = requestedRightGlyph;
+
+  writeRawGlyph(DISP_TENS_PINS, currentLeftGlyph);
+  writeRawGlyph(DISP_ONES_PINS, currentRightGlyph);
+}
+
 static uint32_t lastPrint = 0;
 static uint32_t lastRobotSendMs = 0;
 
-#define TEENSY_READY_PIN 3   // ESP32 D3 / GPIO3, driven by Teensy GPIO27
+#define TEENSY_READY_PIN D3   // ESP32 D3 / GPIO3, driven by Teensy GPIO27
 
 
 
@@ -369,11 +521,58 @@ void sendCachedDataToTeensyWhenReady() {
   Serial0.flush();
 }
 
+void updateDebugStatusCode() {
+  uint32_t now = millis();
+
+  bool userConnected =
+    (now - lastRx1 < 1000) ||
+    (now - lastRx2 < 1000) ||
+    (now - lastRx3 < 1000);
+
+  bool allUserImusFresh =
+    (now - lastRx1 < 500) &&
+    (now - lastRx2 < 500) &&
+    (now - lastRx3 < 500);
+
+  bool teensyReady = digitalRead(TEENSY_READY_PIN);
+
+  if (!wifi_ok) {
+    requestDebugFault(FAULT_COMM);
+    return;
+  }
+
+  if (!imu_ok) {
+    requestDebugFault(FAULT_IMU);
+    return;
+  }
+
+  if (!userConnected) {
+    requestDebugCode(DBG_WAIT_USER);      // 01
+    return;
+  }
+
+  if (!teensyReady) {
+    requestDebugCode(DBG_WAIT_TEENSY);    // 03
+    return;
+  }
+
+  if (!allUserImusFresh) {
+    requestDebugFault(FAULT_IMU);         // E2
+    return;
+  }
+
+  requestDebugCode(DBG_TELEOP_ACTIVE);    // 07
+}
+
 void setup() {
   pinMode(ledRed, OUTPUT);
   pinMode(ledGreen, OUTPUT);
   pinMode(ledBlue, OUTPUT);
   pinMode(TEENSY_READY_PIN, INPUT);
+
+  initDebugDisplay();
+  requestDebugCode(DBG_BOOT);   // 00
+  updateDebugDisplay();
 
   delay(1000);
   Serial.begin(2000000);  // USB serial for debug
@@ -430,4 +629,6 @@ if (now - lastUdpDebug >= 200) {
   Serial.print(" | robotIMU:");
   Serial.println(imu_ok ? "OK" : "NO");
 }
+  updateDebugStatusCode();
+  updateDebugDisplay();
 }
