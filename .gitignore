@@ -1,5 +1,6 @@
 # Local configuration and credentials
 **/config.h
+!firmware/arm-controller-teensy41/lib/Dynamixel2Arduino/src/utility/config.h
 **/secrets.h
 **/.env
 **/.env.*
