@@ -522,7 +522,7 @@ void setup() {
   digitalWrite(Config::LED_GREEN, HIGH);
   digitalWrite(Config::LED_BLUE, HIGH);
   if (Config::DISPLAY_ENABLED) {
-    for (uint8_t i = 0; i < 4; ++i) {
+    for (uint8_t i = 0; i < 4; ++i) { 
       pinMode(Config::DISPLAY_ONES[i], OUTPUT);
       pinMode(Config::DISPLAY_TENS[i], OUTPUT);
     }

@@ -150,7 +150,7 @@ Here is the **exact identity** of every part:
 | `.bytes` | **Library (`Frame` member)** | Fixed-capacity `uint8_t` array storing the full wire packet | **No**, not without changing the structure and its users |
 | `.length` | **Library (`Frame` member)** | `size_t` count of *valid* bytes in `.bytes` | **No**, not without changing the structure and its users |
 | `HRP2::MAX_FRAME` | Library | Buffer capacity: `267` bytes | Reference by this symbol, not a locally invented value |
-
+ 
 **Critical distinction:** `HRP2::Frame` is a **software buffer wrapper**, **not** a packed C++ representation of the wire header. Only `frame.bytes[0]` through `frame.bytes[frame.length - 1]` are sent over UART/UDP. The separate C++ member `frame.length` is **not transmitted**; it tells your program how much of the array contains a complete frame.
 
 The 267 bytes in `.bytes` are capacity; they do not mean there are always 267 bytes of valid data. A newly created `Frame` has `length == 0` and a zero-initialized array. It is not yet a valid packet.
