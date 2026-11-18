@@ -1,4 +1,5 @@
-//HARRP V2.0 Teensy 4.1 FreeRTOS control software v1.05
+//HARRP V2.0 Teensy 4.1 FreeRTOS control software v1.06
+// Software-only motion pipeline. DO NOT enable motors until hardware validation.
 #include <Arduino.h>
 #include <math.h>
 
@@ -23,6 +24,9 @@ constexpr TickType_t SAFETY_PERIOD =
 constexpr TickType_t CONTROL_PERIOD =
     pdMS_TO_TICKS(10);      // 100 Hz
 
+constexpr TickType_t TRAJECTORY_PERIOD =
+    pdMS_TO_TICKS(10);  // 100 Hz
+
 constexpr TickType_t MOTOR_PERIOD =
     pdMS_TO_TICKS(10);      // 100 Hz
 
@@ -33,6 +37,7 @@ constexpr TickType_t DIAGNOSTIC_PERIOD =
 // not bytes. On Teensy 4.1 this will normally mean 32-bit words.
 constexpr uint16_t SAFETY_STACK_DEPTH = 512;
 constexpr uint16_t CONTROL_STACK_DEPTH = 1024;
+constexpr uint16_t TRAJECTORY_STACK_DEPTH = 768;
 constexpr uint16_t MOTOR_STACK_DEPTH = 768;
 constexpr uint16_t DIAGNOSTIC_STACK_DEPTH = 512;
 
@@ -47,6 +52,36 @@ constexpr uint32_t JOINT_COMMAND_VALIDITY_MS = 50;
 
 // Maximum age of measured motor feedback.
 constexpr uint32_t JOINT_STATE_MAX_AGE_MS = 100;
+
+constexpr uint32_t JOINT_GOAL_VALIDITY_MS = 50;
+
+constexpr uint32_t TASK_WATCHDOG_MS = 300;
+constexpr uint32_t TASK_WATCHDOG_BOOT_GRACE_MS = 2000;
+
+// Hardware configuration — NOT YET VERIFIED
+constexpr bool ESTOP_PIN_CONFIGURED = false;
+constexpr uint8_t ESTOP_PIN = 255;
+constexpr uint8_t ESTOP_RELEASED_LEVEL = arduino::LOW;
+
+constexpr bool MOTOR_ENABLE_PIN_CONFIGURED = false;
+constexpr uint8_t MOTOR_ENABLE_PIN = 255;
+constexpr uint8_t MOTOR_ENABLE_DISABLED_LEVEL = arduino::LOW;
+
+// Physical joint limits — NOT YET CONFIGURED
+constexpr bool JOINT_LIMITS_CONFIGURED = false;
+constexpr bool KINEMATICS_CONFIGURED = false;
+
+constexpr float JOINT_MIN_RAD[7] =
+    {0, 0, 0, 0, 0, 0, 0};
+
+constexpr float JOINT_MAX_RAD[7] =
+    {0, 0, 0, 0, 0, 0, 0};
+
+constexpr float JOINT_MAX_VELOCITY_RAD_S[7] =
+    {0, 0, 0, 0, 0, 0, 0};
+
+constexpr float JOINT_MAX_ACCEL_RAD_S2[7] =
+    {0, 0, 0, 0, 0, 0, 0};
 
 
 // Keep false until all of these are implemented and tested:
@@ -86,7 +121,10 @@ enum class FaultCode : uint16_t
     JointLimitViolation,
     JointStateTimeout,
     MotorCommunicationFailure,
-    EmergencyStopActive
+    EmergencyStopActive,
+    TaskWatchdogFailure,
+    JointGoalTimeout,
+    TrajectoryFailure
 };
 
 // ============================================================
@@ -143,6 +181,19 @@ struct JointState
     bool valid;
 };
 
+struct JointGoal
+{
+    float positionRad[Config::JOINT_COUNT];
+
+    float velocityLimitRadPerSecond[Config::JOINT_COUNT];
+
+    uint32_t sourceSequence;
+    uint32_t generatedAtMs;
+    uint32_t validityMs;
+
+    bool valid;
+};
+
 struct JointCommand
 {
     float positionRad[Config::JOINT_COUNT];
@@ -174,13 +225,30 @@ struct SystemStatus
 
 TaskHandle_t safetyTaskHandle = nullptr;
 TaskHandle_t controlTaskHandle = nullptr;
+TaskHandle_t trajectoryTaskHandle = nullptr;
 TaskHandle_t motorTaskHandle = nullptr;
 TaskHandle_t diagnosticTaskHandle = nullptr;
 
 // Length-one queues act as latest-value mailboxes.
 QueueHandle_t targetMailbox = nullptr;
 QueueHandle_t jointStateMailbox = nullptr;
+QueueHandle_t jointGoalMailbox = nullptr;
 QueueHandle_t jointCommandMailbox = nullptr;
+
+volatile uint32_t controlHeartbeatMs = 0;
+volatile uint32_t trajectoryHeartbeatMs = 0;
+volatile uint32_t motorHeartbeatMs = 0;
+
+volatile uint32_t safetyLoopCount = 0;
+volatile uint32_t controlLoopCount = 0;
+volatile uint32_t trajectoryLoopCount = 0;
+volatile uint32_t motorLoopCount = 0;
+
+struct AxisProfile
+{
+    float positionRad;
+    float velocityRadPerSecond;
+};
 
 SystemStatus systemStatus{
     RobotState::Boot,
@@ -196,6 +264,7 @@ SystemStatus systemStatus{
 
 void safetyTask(void* parameter);
 void controlTask(void* parameter);
+void trajectoryTask(void* parameter);
 void motorTask(void* parameter);
 void diagnosticTask(void* parameter);
 
@@ -208,6 +277,14 @@ bool createTasks();
 SystemStatus getSystemStatus();
 void setMotionCommandPermission(bool permitted);
 void enterHold();
+bool requestReady();
+bool requestActive();
+bool requestIdle();
+
+void forceMotorEnableDisabled();
+bool estopIsReleased();
+
+bool runTrajectoryMathSelfTest();
 void raiseFault(FaultCode fault);
 
 bool validateTargetFields(const TargetPose& target);
@@ -215,6 +292,13 @@ bool targetIsFresh(const TargetPose& target, uint32_t nowMs);
 
 bool jointStateIsFresh(
     const JointState& state,
+    uint32_t nowMs
+);
+
+bool validateJointGoal(const JointGoal& goal);
+
+bool jointGoalIsFresh(
+    const JointGoal& goal,
     uint32_t nowMs
 );
 
@@ -245,7 +329,16 @@ bool publishJointState(JointState state);
 bool calculateInverseKinematics(
     const TargetPose& target,
     const JointState& measuredState,
-    JointCommand& command
+    JointGoal& goal
+);
+
+// Trajectory generator
+bool advanceAxisProfile(
+    AxisProfile& axis,
+    float target,
+    float velocityLimit,
+    float accelerationLimit,
+    float dt
 );
 
 bool sendJointCommandToMotors(
@@ -267,6 +360,12 @@ void setup()
     if (!createRtosObjects())
     {
         stopOnStartupFailure();
+    }
+
+    if (!runTrajectoryMathSelfTest())
+    {
+    Serial.println("FATAL: trajectory math self-test failed");
+    stopOnStartupFailure();
     }
 
     if (!createTasks())
@@ -292,26 +391,51 @@ void loop()
 // Initialization
 // ============================================================
 
-void initializeSystem()
+void forceMotorEnableDisabled() //Establishes the safety interface.
 {
-    /*
-     * Hardware initialization to be added later:
-     *
-     * 1. Configure the normally-closed emergency-stop input.
-     * 2. Force the physical motor-enable output into its safe state.
-     * 3. Initialize the Dynamixel serial bus.
-     * 4. Ping all required motors.
-     * 5. Read their initial positions.
-     *
-     * This is currently a structure-only build.
-     * ENABLE_MOTOR_TRANSMISSION remains false, so transitioning
-     * to Idle cannot permit motor commands.
-     */
+    if (Config::MOTOR_ENABLE_PIN_CONFIGURED)
+    {
+        digitalWrite(
+            Config::MOTOR_ENABLE_PIN,
+            Config::MOTOR_ENABLE_DISABLED_LEVEL
+        );
+    }
+}
+
+bool estopIsReleased()
+{
+    if (!Config::ESTOP_PIN_CONFIGURED)
+        return false;
+
+    return digitalRead(Config::ESTOP_PIN)
+        == Config::ESTOP_RELEASED_LEVEL;
+}
+
+void initializeSystem() //Initializes only verified hardware interfaces, keeps motion disabled, and starts the controller in Idle without automatically entering an armed state.
+{
+    if (Config::MOTOR_ENABLE_PIN_CONFIGURED)
+    {
+        digitalWrite(
+            Config::MOTOR_ENABLE_PIN,
+            Config::MOTOR_ENABLE_DISABLED_LEVEL
+        );
+
+        pinMode(Config::MOTOR_ENABLE_PIN, arduino::OUTPUT);
+
+        forceMotorEnableDisabled();
+    }
+
+    if (Config::ESTOP_PIN_CONFIGURED)
+    {
+        pinMode(Config::ESTOP_PIN, arduino::INPUT_PULLUP);
+    }
+
     systemStatus.state = RobotState::SelfTest;
     systemStatus.fault = FaultCode::None;
     systemStatus.stateChangedAtMs = millis();
     systemStatus.faultRaisedAtMs = 0;
     systemStatus.motionCommandPermitted = false;
+
     systemStatus.state = RobotState::Idle;
     systemStatus.stateChangedAtMs = millis();
 }
@@ -324,12 +448,16 @@ bool createRtosObjects()
     jointStateMailbox =
         xQueueCreate(1, sizeof(JointState));
 
+    jointGoalMailbox =
+        xQueueCreate(1, sizeof(JointGoal));
+
     jointCommandMailbox =
         xQueueCreate(1, sizeof(JointCommand));
 
     if (
         targetMailbox == nullptr ||
         jointStateMailbox == nullptr ||
+        jointGoalMailbox == nullptr ||
         jointCommandMailbox == nullptr
     )
     {
@@ -340,6 +468,12 @@ bool createRtosObjects()
     const TargetPose invalidTarget{};
     const JointState invalidJointState{};
     const JointCommand invalidJointCommand{};
+    const JointGoal invalidJointGoal{};
+
+    xQueueOverwrite(
+        jointGoalMailbox,
+        &invalidJointGoal
+    );
 
     xQueueOverwrite(
         targetMailbox,
@@ -397,6 +531,20 @@ bool createTasks()
 
     if (
         xTaskCreate(
+            trajectoryTask,
+            "Trajectory",
+            Config::TRAJECTORY_STACK_DEPTH,
+            nullptr,
+            3,
+            &trajectoryTaskHandle
+        ) != pdPASS
+    )
+    {
+        return false;
+    }
+
+    if (
+        xTaskCreate(
             motorTask,
             "Motor",
             Config::MOTOR_STACK_DEPTH,
@@ -434,10 +582,7 @@ bool createTasks()
     systemStatus.faultRaisedAtMs = millis();
     systemStatus.motionCommandPermitted = false;
 
-    /*
-     * TODO:
-     * Force the physical motor-enable output low here.
-     */
+    forceMotorEnableDisabled();
 
     Serial.println(
         "FATAL: RTOS startup failed; motors remain disabled"
@@ -456,51 +601,44 @@ bool createTasks()
 
 void safetyTask(void*)
 {
-    TickType_t previousWakeTime =
-        xTaskGetTickCount();
+    TickType_t previousWakeTime = xTaskGetTickCount();
+    const uint32_t bootMs = millis();
 
     while (true)
     {
         const uint32_t nowMs = millis();
 
-        const SystemStatus status =
-            getSystemStatus();
+        ++safetyLoopCount;
 
-        /*
-         * TODO:
-         * Replace this with the real normally-closed
-         * emergency-stop input.
-         */
-        const bool emergencyStopActive = false;
+        const SystemStatus status = getSystemStatus();
 
-        if (emergencyStopActive)
+        // Never authorize movement without configured safety hardware.
+        if (!Config::ESTOP_PIN_CONFIGURED ||
+            !Config::MOTOR_ENABLE_PIN_CONFIGURED)
         {
-            raiseFault(
-                FaultCode::EmergencyStopActive
-            );
+            setMotionCommandPermission(false);
+            forceMotorEnableDisabled();
         }
-        else if (
-            status.state == RobotState::Active
-        )
+        else if (!estopIsReleased())
+        {
+            forceMotorEnableDisabled();
+            raiseFault(FaultCode::EmergencyStopActive);
+        }
+        else if (status.state == RobotState::Active)
         {
             TargetPose target{};
+            JointState measured{};
 
-            const bool targetAvailable =
-                xQueuePeek(
-                    targetMailbox,
-                    &target,
-                    0
-                ) == pdPASS;
+            const bool targetFresh =
+                xQueuePeek(targetMailbox, &target, 0) == pdPASS &&
+                targetIsFresh(target, nowMs);
 
-            if (
-                !targetAvailable ||
-                !targetIsFresh(target, nowMs)
-            )
+            const bool stateFresh =
+                xQueuePeek(jointStateMailbox, &measured, 0) == pdPASS &&
+                jointStateIsFresh(measured, nowMs);
+
+            if (!targetFresh || !stateFresh)
             {
-                /*
-                 * Loss of the live command stream stops new
-                 * movement immediately.
-                 */
                 enterHold();
             }
             else
@@ -515,6 +653,26 @@ void safetyTask(void*)
             setMotionCommandPermission(false);
         }
 
+        // Detect stalled control, trajectory, or motor tasks.
+        if (
+            (uint32_t)(nowMs - bootMs) >
+                Config::TASK_WATCHDOG_BOOT_GRACE_MS &&
+            (
+                (uint32_t)(nowMs - controlHeartbeatMs) >
+                    Config::TASK_WATCHDOG_MS ||
+
+                (uint32_t)(nowMs - trajectoryHeartbeatMs) >
+                    Config::TASK_WATCHDOG_MS ||
+
+                (uint32_t)(nowMs - motorHeartbeatMs) >
+                    Config::TASK_WATCHDOG_MS
+            )
+        )
+        {
+            forceMotorEnableDisabled();
+            raiseFault(FaultCode::TaskWatchdogFailure);
+        }
+
         vTaskDelayUntil(
             &previousWakeTime,
             Config::SAFETY_PERIOD
@@ -524,15 +682,16 @@ void safetyTask(void*)
 
 void controlTask(void*)
 {
-    TickType_t previousWakeTime =
-        xTaskGetTickCount();
+    TickType_t previousWakeTime = xTaskGetTickCount();
 
     while (true)
     {
         const uint32_t nowMs = millis();
 
-        const SystemStatus status =
-            getSystemStatus();
+        controlHeartbeatMs = nowMs;
+        ++controlLoopCount;
+
+        const SystemStatus status = getSystemStatus();
 
         if (
             status.state == RobotState::Ready ||
@@ -540,9 +699,9 @@ void controlTask(void*)
         )
         {
             TargetPose target{};
-            JointState measuredState{};
+            JointState measured{};
 
-            const bool targetAvailable =
+            const bool targetFresh =
                 xQueuePeek(
                     targetMailbox,
                     &target,
@@ -550,75 +709,221 @@ void controlTask(void*)
                 ) == pdPASS &&
                 targetIsFresh(target, nowMs);
 
-            const bool jointStateAvailable =
+            const bool feedbackFresh =
                 xQueuePeek(
                     jointStateMailbox,
-                    &measuredState,
+                    &measured,
                     0
                 ) == pdPASS &&
-                jointStateIsFresh(
-                    measuredState,
-                    nowMs
-                );
+                jointStateIsFresh(measured, nowMs);
 
-            if (
-                targetAvailable &&
-                jointStateAvailable
-            )
+            if (targetFresh && feedbackFresh)
             {
-                JointCommand nextCommand{};
+                JointGoal goal{};
 
-                if (
-                    !calculateInverseKinematics(
-                        target,
-                        measuredState,
-                        nextCommand
-                    )
-                )
+                if (!calculateInverseKinematics(
+                    target,
+                    measured,
+                    goal
+                ))
                 {
-                    raiseFault(
-                        FaultCode::IkFailure
-                    );
+                    raiseFault(FaultCode::IkFailure);
                 }
                 else
                 {
-                    nextCommand.sourceSequence =
-                        target.sequence;
+                    goal.sourceSequence = target.sequence;
+                    goal.generatedAtMs = nowMs;
+                    goal.validityMs =
+                        Config::JOINT_GOAL_VALIDITY_MS;
+                    goal.valid = true;
 
-                    nextCommand.generatedAtMs =
-                        nowMs;
-
-                    nextCommand.validityMs =
-                        Config::
-                            JOINT_COMMAND_VALIDITY_MS;
-
-                    nextCommand.valid = true;
-
-                    if (
-                        !validateJointCommand(
-                            nextCommand
-                        )
-                    )
+                    if (!validateJointGoal(goal))
                     {
                         raiseFault(
-                            FaultCode::
-                                InvalidJointCommand
+                            FaultCode::InvalidJointCommand
                         );
                     }
                     else
                     {
                         xQueueOverwrite(
-                            jointCommandMailbox,
-                            &nextCommand
+                            jointGoalMailbox,
+                            &goal
                         );
                     }
                 }
+            }
+            else if (status.state == RobotState::Active)
+            {
+                enterHold();
             }
         }
 
         vTaskDelayUntil(
             &previousWakeTime,
             Config::CONTROL_PERIOD
+        );
+    }
+}
+
+void trajectoryTask(void*)
+{
+    TickType_t previousWakeTime = xTaskGetTickCount();
+
+    AxisProfile profile[Config::JOINT_COUNT]{};
+
+    bool initialized = false;
+    uint32_t lastUpdateMs = 0;
+
+    while (true)
+    {
+        const uint32_t nowMs = millis();
+
+        trajectoryHeartbeatMs = nowMs;
+        ++trajectoryLoopCount;
+
+        const SystemStatus status = getSystemStatus();
+
+        JointGoal goal{};
+        JointState measured{};
+        TargetPose target{};
+
+        const bool allowedState =
+            status.state == RobotState::Ready ||
+            status.state == RobotState::Active;
+
+        const bool validData =
+            allowedState &&
+            Config::JOINT_LIMITS_CONFIGURED &&
+
+            xQueuePeek(
+                jointGoalMailbox,
+                &goal,
+                0
+            ) == pdPASS &&
+
+            jointGoalIsFresh(goal, nowMs) &&
+
+            xQueuePeek(
+                jointStateMailbox,
+                &measured,
+                0
+            ) == pdPASS &&
+
+            jointStateIsFresh(measured, nowMs) &&
+
+            xQueuePeek(
+                targetMailbox,
+                &target,
+                0
+            ) == pdPASS &&
+
+            targetIsFresh(target, nowMs) &&
+
+            target.sequence == goal.sourceSequence;
+
+        if (!validData)
+        {
+            initialized = false;
+
+            const JointCommand invalid{};
+
+            xQueueOverwrite(
+                jointCommandMailbox,
+                &invalid
+            );
+        }
+        else
+        {
+            // Initialize from real joint feedback.
+            if (!initialized)
+            {
+                for (
+                    uint8_t j = 0;
+                    j < Config::JOINT_COUNT;
+                    ++j
+                )
+                {
+                    profile[j].positionRad =
+                        measured.positionRad[j];
+
+                    profile[j].velocityRadPerSecond = 0.0f;
+                }
+
+                lastUpdateMs = nowMs;
+                initialized = true;
+            }
+
+            const float dt = fminf(
+                0.02f,
+                fmaxf(
+                    0.001f,
+                    (uint32_t)(nowMs - lastUpdateMs) * 0.001f
+                )
+            );
+
+            lastUpdateMs = nowMs;
+
+            JointCommand command{};
+            bool valid = true;
+
+            for (
+                uint8_t j = 0;
+                j < Config::JOINT_COUNT;
+                ++j
+            )
+            {
+                const float velocityCap = fminf(
+                    goal.velocityLimitRadPerSecond[j],
+                    Config::JOINT_MAX_VELOCITY_RAD_S[j]
+                );
+
+                if (!advanceAxisProfile(profile[j], goal.positionRad[j], velocityCap, Config::JOINT_MAX_ACCEL_RAD_S2[j],dt))
+                {
+                    valid = false;
+                    break;
+                }
+
+                command.positionRad[j] =
+                    profile[j].positionRad;
+
+                command.velocityLimitRadPerSecond[j] =
+                    velocityCap;
+            }
+
+            if (!valid)
+            {
+                initialized = false;
+                raiseFault(FaultCode::TrajectoryFailure);
+            }
+            else
+            {
+                command.sourceSequence = goal.sourceSequence;
+                command.generatedAtMs = nowMs;
+                command.validityMs =
+                    Config::JOINT_COMMAND_VALIDITY_MS;
+                command.valid = true;
+
+                if (validateJointCommand(command))
+                {
+                    xQueueOverwrite(
+                        jointCommandMailbox,
+                        &command
+                    );
+                }
+                else
+                {
+                    initialized = false;
+
+                    raiseFault(
+                        FaultCode::InvalidJointCommand
+                    );
+                }
+            }
+        }
+
+        vTaskDelayUntil(
+            &previousWakeTime,
+            Config::TRAJECTORY_PERIOD
         );
     }
 }
@@ -633,6 +938,8 @@ void motorTask(void*)
     while (true)
     {
         const uint32_t nowMs = millis();
+        motorHeartbeatMs = nowMs;
+        ++motorLoopCount;
 
         JointCommand command{};
 
@@ -768,7 +1075,34 @@ void diagnosticTask(void*)
         {
             Serial.print("INVALID");
         }
+        Serial.print(" | Task loops(S/C/T/M): ");
 
+        Serial.print(safetyLoopCount);
+        Serial.print('/');
+
+        Serial.print(controlLoopCount);
+        Serial.print('/');
+
+        Serial.print(trajectoryLoopCount);
+        Serial.print('/');
+
+        Serial.print(motorLoopCount);
+
+        Serial.print(" | ESTOP: ");
+
+        Serial.print(
+            Config::ESTOP_PIN_CONFIGURED
+                ? (estopIsReleased() ? "RELEASED" : "ACTIVE")
+                : "UNCONFIGURED"
+        );
+
+        Serial.print(" | Motors: ");
+
+        Serial.print(
+            Config::ENABLE_MOTOR_TRANSMISSION
+                ? "ENABLED"
+                : "LOCKED"
+        );
         Serial.print(" | Command age: ");
 
         if (command.valid)
@@ -886,6 +1220,147 @@ void setMotionCommandPermission(bool permitted)
     taskEXIT_CRITICAL();
 }
 
+static bool physicalSafetyConfigured()
+{
+    return Config::ESTOP_PIN_CONFIGURED &&
+           Config::MOTOR_ENABLE_PIN_CONFIGURED &&
+           Config::ESTOP_PIN != Config::MOTOR_ENABLE_PIN &&
+           Config::ESTOP_PIN != 255 &&
+           Config::MOTOR_ENABLE_PIN != 255;
+}
+
+static bool physicalJointLimitsConfigured()
+{
+    if (!Config::JOINT_LIMITS_CONFIGURED)
+        return false;
+
+    for (
+        uint8_t j = 0;
+        j < Config::JOINT_COUNT;
+        ++j
+    )
+    {
+        if (
+            !isfinite(Config::JOINT_MIN_RAD[j]) ||
+            !isfinite(Config::JOINT_MAX_RAD[j]) ||
+            Config::JOINT_MIN_RAD[j] >=
+                Config::JOINT_MAX_RAD[j] ||
+            Config::JOINT_MAX_VELOCITY_RAD_S[j] <= 0 ||
+            Config::JOINT_MAX_ACCEL_RAD_S2[j] <= 0
+        )
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool requestReady()
+{
+    if (
+        !Config::ENABLE_MOTOR_TRANSMISSION ||
+        !Config::KINEMATICS_CONFIGURED ||
+        !physicalSafetyConfigured() ||
+        !physicalJointLimitsConfigured() ||
+        !estopIsReleased()
+    )
+    {
+        return false;
+    }
+
+    JointState measured{};
+
+    if (
+        jointStateMailbox == nullptr ||
+        xQueuePeek(
+            jointStateMailbox,
+            &measured,
+            0
+        ) != pdPASS ||
+        !jointStateIsFresh(measured, millis())
+    )
+    {
+        return false;
+    }
+
+    taskENTER_CRITICAL();
+
+    const bool allowed =
+        systemStatus.fault == FaultCode::None &&
+        (
+            systemStatus.state == RobotState::Idle ||
+            systemStatus.state == RobotState::Hold
+        );
+
+    if (allowed)
+    {
+        systemStatus.state = RobotState::Ready;
+        systemStatus.stateChangedAtMs = millis();
+        systemStatus.motionCommandPermitted = false;
+    }
+
+    taskEXIT_CRITICAL();
+
+    return allowed;
+}
+
+bool requestActive()
+{
+    if (
+        !Config::ENABLE_MOTOR_TRANSMISSION ||
+        !physicalSafetyConfigured() ||
+        !estopIsReleased() ||
+        !physicalJointLimitsConfigured() ||
+        !Config::KINEMATICS_CONFIGURED ||
+        !controlDataReady(millis())
+    )
+    {
+        return false;
+    }
+
+    taskENTER_CRITICAL();
+
+    const bool allowed =
+        systemStatus.state == RobotState::Ready &&
+        systemStatus.fault == FaultCode::None;
+
+    if (allowed)
+    {
+        systemStatus.state = RobotState::Active;
+        systemStatus.stateChangedAtMs = millis();
+
+        systemStatus.motionCommandPermitted = false;
+    }
+
+    taskEXIT_CRITICAL();
+
+    return allowed;
+}
+
+bool requestIdle()
+{
+    taskENTER_CRITICAL();
+
+    const bool allowed =
+        systemStatus.fault == FaultCode::None &&
+        (
+            systemStatus.state == RobotState::Ready ||
+            systemStatus.state == RobotState::Hold
+        );
+
+    if (allowed)
+    {
+        systemStatus.state = RobotState::Idle;
+        systemStatus.stateChangedAtMs = millis();
+        systemStatus.motionCommandPermitted = false;
+    }
+
+    taskEXIT_CRITICAL();
+
+    return allowed;
+}
+
 void enterHold()
 {
     taskENTER_CRITICAL();
@@ -903,10 +1378,15 @@ void enterHold()
 
     taskEXIT_CRITICAL();
 
-    /*
-     * Invalidate the old command. Returning to Active will
-     * therefore require a newly calculated command.
-     */
+    if (jointGoalMailbox != nullptr)
+    {
+    const JointGoal invalidGoal{};
+
+    xQueueOverwrite(
+        jointGoalMailbox,
+        &invalidGoal
+    );
+    }
     if (jointCommandMailbox != nullptr)
     {
         const JointCommand invalidCommand{};
@@ -964,15 +1444,7 @@ void raiseFault(FaultCode fault)
         );
     }
 
-    /*
-     * TODO:
-     * Directly operate the physical motor-enable output here.
-     *
-     * The eventual implementation must distinguish between:
-     * - controlled hold,
-     * - torque disable,
-     * - motor-power relay opening.
-     */
+    forceMotorEnableDisabled();
 }
 
 // ============================================================
@@ -1100,9 +1572,60 @@ bool jointStateIsFresh(
     return true;
 }
 
-bool validateJointCommand(
-    const JointCommand& command
+bool validateJointGoal(const JointGoal& goal)
+{
+    if (
+        !Config::JOINT_LIMITS_CONFIGURED ||
+        !goal.valid ||
+        goal.validityMs == 0 ||
+        goal.validityMs > Config::JOINT_GOAL_VALIDITY_MS
+    )
+    {
+        return false;
+    }
+
+    for (
+        uint8_t j = 0;
+        j < Config::JOINT_COUNT;
+        ++j
+    )
+    {
+        if (
+            !isfinite(goal.positionRad[j]) ||
+            !isfinite(goal.velocityLimitRadPerSecond[j]) ||
+
+            goal.positionRad[j] <
+                Config::JOINT_MIN_RAD[j] ||
+
+            goal.positionRad[j] >
+                Config::JOINT_MAX_RAD[j] ||
+
+            goal.velocityLimitRadPerSecond[j] <= 0 ||
+
+            goal.velocityLimitRadPerSecond[j] >
+                Config::JOINT_MAX_VELOCITY_RAD_S[j] ||
+
+            Config::JOINT_MAX_ACCEL_RAD_S2[j] <= 0
+        )
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool jointGoalIsFresh(
+    const JointGoal& goal,
+    uint32_t nowMs
 )
+{
+    return validateJointGoal(goal) &&
+        (uint32_t)(nowMs - goal.generatedAtMs)
+            <= goal.validityMs;
+}
+
+bool validateJointCommand(const JointCommand& command)
 {
     if (
         command.validityMs == 0 ||
@@ -1130,10 +1653,21 @@ bool validateJointCommand(
             return false;
         }
 
-        /*
-         * TODO:
-         * Apply final V2 limits for every joint here.
-         */
+        if (
+    !Config::JOINT_LIMITS_CONFIGURED ||
+
+    command.positionRad[joint] <
+        Config::JOINT_MIN_RAD[joint] ||
+
+    command.positionRad[joint] >
+        Config::JOINT_MAX_RAD[joint] ||
+
+    command.velocityLimitRadPerSecond[joint] >
+        Config::JOINT_MAX_VELOCITY_RAD_S[joint]
+)
+{
+    return false;
+}
     }
 
     return true;
@@ -1242,20 +1776,177 @@ bool movementPermitted(
 // Kinematics and motor placeholders
 // ============================================================
 
-bool calculateInverseKinematics(
-    const TargetPose& target,
-    const JointState& measuredState,
-    JointCommand& command
+static inline float clampFloat(
+    float value,
+    float lo,
+    float hi
 )
+{
+    return value < lo
+        ? lo
+        : (value > hi ? hi : value);
+}
+
+bool advanceAxisProfile(AxisProfile& axis, float target, float velocityLimit, float accelerationLimit, float dt)
+{
+    if (
+        !isfinite(axis.positionRad) ||
+        !isfinite(axis.velocityRadPerSecond) ||
+        !isfinite(target) ||
+        !isfinite(velocityLimit) ||
+        !isfinite(accelerationLimit) ||
+        !isfinite(dt) ||
+        velocityLimit <= 0.0f ||
+        accelerationLimit <= 0.0f ||
+        dt <= 0.0f ||
+        dt > 0.05f
+    )
+    {
+        return false;
+    }
+
+    const float error =
+        target - axis.positionRad;
+
+    const float brakingSpeed = sqrtf(
+        fmaxf(
+            0.0f,
+            2.0f * accelerationLimit * fabsf(error)
+        )
+    );
+
+    const float brakingMargin =
+        0.5f * accelerationLimit * dt;
+
+    const float requestedSpeed =
+        (
+            error > 0 ? 1.0f :
+            (error < 0 ? -1.0f : 0.0f)
+        ) *
+        fminf(
+            velocityLimit,
+            fmaxf(0.0f, brakingSpeed - brakingMargin)
+        );
+
+    const float deltaSpeed =
+        accelerationLimit * dt;
+
+    if (
+        fabsf(error) <= accelerationLimit * dt * dt &&
+        fabsf(axis.velocityRadPerSecond) <= deltaSpeed
+    )
+    {
+        axis.positionRad = target;
+        axis.velocityRadPerSecond = 0.0f;
+    }
+    else
+    {
+        const float newSpeed = clampFloat(
+            requestedSpeed,
+
+            axis.velocityRadPerSecond - deltaSpeed,
+
+            axis.velocityRadPerSecond + deltaSpeed
+        );
+
+        axis.positionRad += newSpeed * dt;
+        axis.velocityRadPerSecond = newSpeed;
+    }
+
+    return
+        isfinite(axis.positionRad) &&
+        isfinite(axis.velocityRadPerSecond);
+}
+
+bool runTrajectoryMathSelfTest()
+{
+    AxisProfile axis{0.0f, 0.0f};
+
+    float previousPosition = axis.positionRad;
+    float previousSpeed = axis.velocityRadPerSecond;
+
+    bool reached = false;
+
+    for (int i = 0; i < 1000; ++i)
+    {
+        if (!advanceAxisProfile(
+            axis,
+            1.0f,
+            0.65f,
+            1.5f,
+            0.01f
+        ))
+        {
+            return false;
+        }
+
+        if (
+            fabsf(axis.velocityRadPerSecond) > 0.651f ||
+            fabsf(axis.velocityRadPerSecond - previousSpeed)
+                > 0.0151f ||
+            axis.positionRad < previousPosition - 0.0001f ||
+            axis.positionRad > 1.00001f
+        )
+        {
+            return false;
+        }
+
+        previousPosition = axis.positionRad;
+        previousSpeed = axis.velocityRadPerSecond;
+
+        if (fabsf(axis.positionRad - 1.0f) < 0.001f)
+        {
+            reached = true;
+            break;
+        }
+    }
+
+    if (!reached)
+        return false;
+
+    // Invalid velocity limit must be rejected.
+    if (advanceAxisProfile(
+        axis, 2.0f, 0.0f, 1.5f, 0.01f
+    ))
+    {
+        return false;
+    }
+
+    // NaN input must be rejected.
+    if (advanceAxisProfile(
+        axis, NAN, 0.65f, 1.5f, 0.01f
+    ))
+    {
+        return false;
+    }
+
+    // Test reverse movement.
+    for (int i = 0; i < 1000; ++i)
+    {
+        if (!advanceAxisProfile(
+            axis,
+            -0.5f,
+            0.65f,
+            1.5f,
+            0.01f
+        ))
+        {
+            return false;
+        }
+    }
+
+    return fabsf(axis.positionRad + 0.5f) < 0.002f;
+}
+
+bool calculateInverseKinematics(const TargetPose& target, const JointState& measuredState, JointGoal& goal)
 {
     (void)target;
     (void)measuredState;
 
-    /*
-     * Keep the command invalid until the 7-DOF IK,
-     * joint limits, and redundancy policy exist.
-     */
-    command = {};
+    goal = {};
+
+    // Real 7-DOF IK requires verified V2 joint axes,
+    // link transforms, zero offsets and joint limits.
 
     return false;
 }
@@ -1266,34 +1957,23 @@ bool sendJointCommandToMotors(
 {
     (void)command;
 
-    /*
-     * Deliberately disabled.
-     *
-     * Returning false ensures that accidental entry into
-     * Active cannot look like successful motor operation.
-     */
+    // Motor task owns the actuator communication interface.
+    // Physical transmission remains disabled.
+
     return false;
 }
 
-void applyNonActiveMotorPolicy(
-    RobotState state
-)
+// New trajectory calculation function
+bool advanceAxisProfile(AxisProfile& axis, float goalPosition, float velocityLimit, float accelerationLimit, float dtSeconds);
+
+bool sendJointCommandToMotors(const JointCommand& command);
+
+void applyNonActiveMotorPolicy(RobotState state)
 {
     (void)state;
 
-    /*
-     * This will be implemented after the Dynamixel layer:
-     *
-     * Idle/Ready:
-     *     Commissioning torque policy.
-     *
-     * Hold:
-     *     Hold the last safe measured joint positions.
-     *
-     * Fault:
-     *     Controlled hold or torque-off depending on cause.
-     *
-     * EmergencyStop:
-     *     Open the physical normally-closed safety relay.
-     */
+    // Gravity-safe HOLD remains to be implemented.
+    // Do not energize the motors in this build.
+
+    forceMotorEnableDisabled();
 }
